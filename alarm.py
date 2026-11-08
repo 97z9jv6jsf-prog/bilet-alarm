@@ -3,7 +3,9 @@
 Galatasaray Bilet Alarmı
 ========================
 Galatasaray'ın resmi sitesini ve Google Haberler'i kontrol eder.
-Yeni bir bilet satış duyurusu çıktığında Telegram'dan bildirim gönderir.
+Sadece Galatasaray'ın KENDİ STADINDA (RAMS Park) oynayacağı
+Şampiyonlar Ligi maçlarının bilet satış duyurularını Telegram'dan bildirir.
+Deplasman maçları, basketbol/voleybol ve gazi-engelli listeleri bildirilmez.
 Bilet SATIN ALMAZ; sadece haber verir, bileti sen alırsın.
 
 Kullanım:
@@ -31,7 +33,18 @@ GS_URL = "https://www.galatasaray.org/anasayfa"
 NEWS_QUERIES = [
     "Galatasaray Şampiyonlar Ligi bilet satışa",
     "Galatasaray maç biletleri satışta",
+    "site:galatasaray.org bilet",
 ]
+
+
+# Resmi Şampiyonlar Ligi fikstür haberi. Eleme turları için yeni fikstür
+# yayınlanırsa bu listeye eklenebilir.
+FIXTURE_URLS = [
+    "https://www.galatasaray.org/haber/futbol/sampiyonlar-ligi/sampiyonlar-ligi-fiksturumuz/60836",
+]
+
+EXCLUDE = ("gazi", "engelli", "deplasman", "misafir", "daikin", "çağdaş", "mct",
+           "voleybol", "basketbol", "kadın", "sultanlar", "euroleague", "eurocup")
 
 
 def tr_lower(s):
@@ -42,6 +55,34 @@ def get(url):
     req = urllib.request.Request(url, headers=UA)
     with urllib.request.urlopen(req, timeout=20) as r:
         return r.read().decode("utf-8", errors="ignore")
+
+
+def home_opponents():
+    """Resmi fikstürden 'Galatasaray - X' satırlarındaki rakipleri (iç saha) alır."""
+    opps = set()
+    for url in FIXTURE_URLS:
+        try:
+            text = html.unescape(re.sub(r"<[^>]+>", "\n", get(url))).replace("\xa0", " ")
+        except Exception as e:
+            print("Uyarı: fikstür okunamadı:", e)
+            continue
+        for opp in re.findall(r"Galatasaray\s*[-–]\s*([A-Za-zÇĞİÖŞÜçğıöşü. ]+?)\s+\d", text):
+            opps.add(tr_lower(opp.strip()))
+    return opps
+
+
+def is_home_ucl(title, opps):
+    # Google Haberler başlık sonundaki " - Yayıncı" kısmını at
+    t = re.sub(r"\s[-–]\s*[^-–]*$", "", tr_lower(title)) if " - " in title else tr_lower(title)
+    if "bilet" not in t or any(k in t for k in EXCLUDE):
+        return False
+    # "X - Galatasaray" -> deplasman
+    if re.search(r"\w\s*[-–]\s*galatasaray", t) and not re.search(r"galatasaray\s*[-–]", t):
+        return False
+    if any(o and o in t for o in opps):
+        return True
+    # Fikstürde olmayan (ör. eleme turu) maçlar: ŞL + iç saha işareti
+    return is_ucl(title) and ("rams park" in t or bool(re.search(r"galatasaray\s*[-–]\s*\w", t)))
 
 
 # ------------------------------------------------------------- kaynaklar
@@ -75,7 +116,7 @@ def from_google_news():
             question = any(k in t for k in ("ne zaman", "mı?", "mi?", "çıkacak"))
             # Resmi GS duyuruları her zaman; diğer siteler sadece
             # Şampiyonlar Ligi + "satışa çıktı" (soru başlıkları hariç)
-            if "bilet" in t and (official or (is_ucl(title) and on_sale and not question)):
+            if "bilet" in t and (official or (on_sale and not question)):
                 items.append({"id": "gn:" + re.sub(r"\W+", "", t)[:120],
                               "title": title, "url": link,
                               "source": "GALATASARAY.ORG (resmi)" if official else "Google Haberler",
@@ -102,7 +143,7 @@ def is_ucl(title):
 
 
 def fmt(item):
-    tag = "⭐ ŞAMPİYONLAR LİGİ\n" if is_ucl(item["title"]) else ""
+    tag = "⭐ ŞAMPİYONLAR LİGİ · RAMS Park\n"
     return f"{tag}{item['title']}\nKaynak: {item['source']}\n{item['url']}"
 
 
@@ -114,6 +155,10 @@ def collect():
             items += fn()
         except Exception as e:
             errors.append(f"{fn.__name__}: {e}")
+    opps = home_opponents()
+    if not opps:
+        errors.append("iç saha rakipleri bulunamadı, sadece başlık kuralları kullanılıyor")
+    items = [it for it in items if is_home_ucl(it["title"], opps)]
     uniq = {}
     for it in items:
         uniq.setdefault(it["id"], it)
