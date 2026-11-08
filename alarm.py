@@ -2,18 +2,29 @@
 """
 Galatasaray Bilet Alarmı
 ========================
-Galatasaray'ın resmi sitesini ve Google Haberler'i kontrol eder.
-Sadece Galatasaray'ın KENDİ STADINDA (RAMS Park) oynayacağı
-Şampiyonlar Ligi maçlarının bilet satış duyurularını Telegram'dan bildirir.
-Deplasman maçları, basketbol/voleybol ve gazi-engelli listeleri bildirilmez.
-Bilet SATIN ALMAZ; sadece haber verir, bileti sen alırsın.
+Galatasaray'ın KENDİ STADINDA (RAMS Park / Ali Sami Yen) oynayacağı
+UEFA Şampiyonlar Ligi maçlarının biletleri SATIŞA ÇIKTIĞI ANDA
+Telegram'dan bildirim gönderir.
+
+Nasıl çalışır:
+  1. galatasaray.org'daki yeni haberleri numarasına göre tek tek kontrol eder.
+  2. Şampiyonlar Ligi + iç saha bilet duyurusu bulunca metindeki satış
+     tarih/saatlerini okur (ör. "31 Ekim Cumartesi günü saat 11.00'de GS logolu
+     Passo Taraftar Kartlarına ...").
+  3. Her satış aşaması için:
+        - satış takvimi açıklandığında bilgi mesajı
+        - satıştan 30 dakika önce hatırlatma
+        - satışın başladığı dakikada "SATIŞ BAŞLADI" mesajı
+  4. Yedek olarak Google Haberler'de "biletleri satışa çıktı" haberlerini izler.
+
+Bilet SATIN ALMAZ; sadece haber verir.
 
 Kullanım:
-    python alarm.py           # kontrol et, yeni duyuru varsa bildir
-    python alarm.py --test    # Telegram'a deneme mesajı gönder
-    python alarm.py --list    # şu an bulunan duyuruları göster (bildirim yok)
+    python alarm.py            # kontrol et, zamanı gelen bildirimleri gönder
+    python alarm.py --test     # Telegram'a deneme mesajı
+    python alarm.py --status   # bekleyen satış aşamalarını göster
 
-Sadece Python'un standart kütüphanesini kullanır (kurulum gerekmez).
+Sadece Python standart kütüphanesi kullanılır.
 """
 
 import html
@@ -21,30 +32,34 @@ import json
 import os
 import re
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 BASE = Path(__file__).resolve().parent
-SEEN_PATH = BASE / "seen.json"
-UA = {"User-Agent": "Mozilla/5.0 (bilet-alarm; +https://github.com)"}
+STATE_PATH = BASE / "state.json"
+TR = ZoneInfo("Europe/Istanbul")
+UA = {"User-Agent": "Mozilla/5.0 (bilet-alarm)"}
 
-GS_URL = "https://www.galatasaray.org/anasayfa"
-NEWS_QUERIES = [
-    "Galatasaray Şampiyonlar Ligi bilet satışa",
-    "Galatasaray maç biletleri satışta",
-    "site:galatasaray.org bilet",
-]
+ARTICLE_URL = "https://www.galatasaray.org/haber/x/x/{}"
+START_ID = 61340          # ilk kurulumda taramaya buradan başlanır
+SCAN_AHEAD = 40           # her çalışmada en fazla bu kadar yeni numara denenir
+MAX_MISSES = 12           # art arda bu kadar boş numara görülürse durulur
+REMIND_BEFORE = timedelta(minutes=30)
+WAIT_WINDOW = timedelta(minutes=11)   # satış bu süre içindeyse tam dakikasını bekle
+
+MONTHS = {"ocak": 1, "şubat": 2, "mart": 3, "nisan": 4, "mayıs": 5, "haziran": 6,
+          "temmuz": 7, "ağustos": 8, "eylül": 9, "ekim": 10, "kasım": 11, "aralık": 12}
+EXCLUDE = ("gazi", "engelli", "deplasman", "misafir")
 
 
-# Resmi Şampiyonlar Ligi fikstür haberi. Eleme turları için yeni fikstür
-# yayınlanırsa bu listeye eklenebilir.
-FIXTURE_URLS = [
-    "https://www.galatasaray.org/haber/futbol/sampiyonlar-ligi/sampiyonlar-ligi-fiksturumuz/60836",
-]
-
-EXCLUDE = ("gazi", "engelli", "deplasman", "misafir", "daikin", "çağdaş", "mct",
-           "voleybol", "basketbol", "kadın", "sultanlar", "euroleague", "eurocup")
+# ------------------------------------------------------------- yardımcılar
+def now_tr():
+    return datetime.now(TR)
 
 
 def tr_lower(s):
@@ -57,79 +72,31 @@ def get(url):
         return r.read().decode("utf-8", errors="ignore")
 
 
-def home_opponents():
-    """Resmi fikstürden 'Galatasaray - X' satırlarındaki rakipleri (iç saha) alır."""
-    opps = set()
-    for url in FIXTURE_URLS:
-        try:
-            text = html.unescape(re.sub(r"<[^>]+>", "\n", get(url))).replace("\xa0", " ")
-        except Exception as e:
-            print("Uyarı: fikstür okunamadı:", e)
-            continue
-        for opp in re.findall(r"Galatasaray\s*[-–]\s*([A-Za-zÇĞİÖŞÜçğıöşü. ]+?)\s+\d", text):
-            opps.add(tr_lower(opp.strip()))
-    return opps
+def page_text(raw):
+    raw = re.sub(r"<script.*?</script>|<style.*?</style>", "", raw, flags=re.S)
+    t = html.unescape(re.sub(r"<[^>]+>", "\n", raw)).replace("\xa0", " ")
+    return re.sub(r"[ \t]*\n\s*", "\n", t)
 
 
-def is_home_ucl(title, opps):
-    # Google Haberler başlık sonundaki " - Yayıncı" kısmını at
-    t = re.sub(r"\s[-–]\s*[^-–]*$", "", tr_lower(title)) if " - " in title else tr_lower(title)
-    if "bilet" not in t or any(k in t for k in EXCLUDE):
-        return False
-    # "X - Galatasaray" -> deplasman
-    if re.search(r"\w\s*[-–]\s*galatasaray", t) and not re.search(r"galatasaray\s*[-–]", t):
-        return False
-    if any(o and o in t for o in opps):
-        return True
-    # Fikstürde olmayan (ör. eleme turu) maçlar: ŞL + iç saha işareti
-    return is_ucl(title) and ("rams park" in t or bool(re.search(r"galatasaray\s*[-–]\s*\w", t)))
+def load_state():
+    if STATE_PATH.exists():
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    return {"last_id": START_ID, "events": [], "sent": [], "seen_news": []}
 
 
-# ------------------------------------------------------------- kaynaklar
-def from_galatasaray_org():
-    """Resmi sitedeki futbol haberlerinden başlığında 'bilet' geçenler."""
-    s = get(GS_URL)
-    items = []
-    for href, title in re.findall(
-            r'href="(/haber/futbol[^"]+)"[^>]*>\s*([^<]{5,})', s):
-        title = html.unescape(title).strip()
-        if "bilet" in tr_lower(title):
-            items.append({"id": href, "title": title,
-                          "url": "https://www.galatasaray.org" + href,
-                          "source": "GALATASARAY.ORG (resmi)", "official": True})
-    return items
+def save_state(st):
+    st["sent"] = st["sent"][-500:]
+    st["seen_news"] = st["seen_news"][-1000:]
+    cutoff = (now_tr() - timedelta(days=30)).isoformat()
+    st["events"] = [e for e in st["events"] if e["when"] > cutoff]
+    STATE_PATH.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
-def from_google_news():
-    items = []
-    for q in NEWS_QUERIES:
-        url = ("https://news.google.com/rss/search?hl=tr&gl=TR&ceid=TR:tr&q="
-               + urllib.parse.quote(q + " when:7d"))
-        s = get(url)
-        for block in re.findall(r"<item>(.*?)</item>", s, re.S):
-            title = html.unescape(re.search(r"<title>(.*?)</title>", block, re.S).group(1))
-            link = re.search(r"<link>(.*?)</link>", block, re.S).group(1).strip()
-            t = tr_lower(title)
-            official = "galatasaray.org" in t
-            on_sale = any(k in t for k in ("satışa çıktı", "satışta", "satışa sunuldu",
-                                            "satış başladı", "satışa açıldı"))
-            question = any(k in t for k in ("ne zaman", "mı?", "mi?", "çıkacak"))
-            # Resmi GS duyuruları her zaman; diğer siteler sadece
-            # Şampiyonlar Ligi + "satışa çıktı" (soru başlıkları hariç)
-            if "bilet" in t and (official or (on_sale and not question)):
-                items.append({"id": "gn:" + re.sub(r"\W+", "", t)[:120],
-                              "title": title, "url": link,
-                              "source": "GALATASARAY.ORG (resmi)" if official else "Google Haberler",
-                              "official": official})
-    return items
-
-
-# ------------------------------------------------------------- telegram
 def notify(text):
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat:
-        print("(Telegram ayarlı değil, mesaj yazdırılıyor)\n" + text)
+        print("(Telegram ayarlı değil)\n" + text + "\n")
         return
     data = urllib.parse.urlencode({"chat_id": chat, "text": text,
                                    "disable_web_page_preview": "true"}).encode()
@@ -137,67 +104,185 @@ def notify(text):
                            data=data, timeout=15)
 
 
-def is_ucl(title):
-    t = tr_lower(title)
-    return any(k in t for k in ("şampiyonlar ligi", "uefa", "champions"))
+# ------------------------------------------------------------- duyuru okuma
+DT_RE = re.compile(
+    r"(\d{1,2})\s+(ocak|şubat|mart|nisan|mayıs|haziran|temmuz|ağustos|eylül|ekim|kasım|aralık)"
+    r"(?:\s+(\d{4}))?\s+\w+\s+günü\s+saat\s+(\d{1,2})[.:](\d{2})", re.I)
 
 
-def fmt(item):
-    tag = "⭐ ŞAMPİYONLAR LİGİ · RAMS Park\n"
-    return f"{tag}{item['title']}\nKaynak: {item['source']}\n{item['url']}"
-
-
-# ------------------------------------------------------------- main
-def collect():
-    items, errors = [], []
-    for fn in (from_galatasaray_org, from_google_news):
-        try:
-            items += fn()
-        except Exception as e:
-            errors.append(f"{fn.__name__}: {e}")
-    opps = home_opponents()
-    if not opps:
-        errors.append("iç saha rakipleri bulunamadı, sadece başlık kuralları kullanılıyor")
-    items = [it for it in items if is_home_ucl(it["title"], opps)]
+def parse_sales(text, ref):
+    """Duyuru metninden satış aşamalarını [(datetime, açıklama)] olarak çıkarır."""
+    low = tr_lower(text)
+    phases = []
+    for m in DT_RE.finditer(low):
+        after = low[m.end():m.end() + 160]
+        before = low[max(0, m.start() - 60):m.start()]
+        # Maç saati cümlesini atla ("... saat 20.45'te VfB Stuttgart takımı ile ...")
+        if re.search(r"takımı ile|ile karşı|karşı karşıya", after[:90]):
+            continue
+        if not re.search(r"bilet|satış|satın|sahipler|kartlar|passo|kombine|taraftar",
+                         before + after):
+            continue
+        day, mon, year, hh, mm = m.groups()
+        year = int(year) if year else ref.year
+        dt = datetime(year, MONTHS[mon], int(day), int(hh), int(mm), tzinfo=TR)
+        if not m.group(3) and dt < ref - timedelta(days=60):
+            dt = dt.replace(year=year + 1)
+        # Kime açık? "...’de GS logolu Passo Taraftar Kartlarına," gibi kısmı al
+        who = re.sub(r"^[’'`]?\s*(?:te|ta|de|da|den|dan|ten|tan)?n?\b\s*", "",
+                     text[m.end():m.end() + 160])
+        who = re.split(r"[,.;\n]", who)[0].strip()
+        who = re.sub(r"\s*(itibaren|satışa sunulacak|satışa çıkacak).*$", "", who).strip()
+        phases.append((dt, who[:90]))
     uniq = {}
-    for it in items:
-        uniq.setdefault(it["id"], it)
-    return list(uniq.values()), errors
+    for dt, who in phases:
+        uniq.setdefault(dt, who)
+    return sorted(uniq.items())
+
+
+def is_home_ucl_article(title, text):
+    t, b = tr_lower(title.replace("- GALATASARAY.ORG", "")), tr_lower(text)
+    return ("bilet" in t and not any(k in t for k in EXCLUDE)
+            and "şampiyonlar ligi" in b
+            and ("ali sami yen" in b or "rams park" in b)
+            and not re.search(r"\w\s+-\s+galatasaray\b", t))
+
+
+def scan_galatasaray(st):
+    """Yeni haber numaralarını dener, ŞL iç saha bilet duyurularını döndürür."""
+    found, misses, i = [], 0, st["last_id"]
+    for i in range(st["last_id"] + 1, st["last_id"] + 1 + SCAN_AHEAD):
+        try:
+            raw = get(ARTICLE_URL.format(i))
+        except Exception:
+            raw = ""
+        m = re.search(r"<title>(.*?)</title>", raw, re.S)
+        title = html.unescape(m.group(1)).replace("- GALATASARAY.ORG", "").strip() if m else ""
+        if not title or "SAYFA BULUNAMADI" in title:
+            misses += 1
+            if misses >= MAX_MISSES:
+                break
+            continue
+        misses = 0
+        st["last_id"] = i
+        text = page_text(raw)
+        if is_home_ucl_article(title, text):
+            found.append({"id": i, "title": title, "text": text,
+                          "url": ARTICLE_URL.format(i).replace("/x/x/", "/futbol/bilet/")})
+    return found
+
+
+def google_news_fallback(st):
+    """Yedek: haber sitelerinde 'Galatasaray-X biletleri satışa çıktı' (ŞL, iç saha)."""
+    q = urllib.parse.quote("Galatasaray Şampiyonlar Ligi biletleri satışa çıktı when:2d")
+    s = get(f"https://news.google.com/rss/search?hl=tr&gl=TR&ceid=TR:tr&q={q}")
+    out = []
+    for block in re.findall(r"<item>(.*?)</item>", s, re.S):
+        title = html.unescape(re.search(r"<title>(.*?)</title>", block, re.S).group(1))
+        link = re.search(r"<link>(.*?)</link>", block, re.S).group(1).strip()
+        t = re.sub(r"\s-\s[^-]*$", "", tr_lower(title))   # " - Yayıncı" kısmını at
+        if ("bilet" in t and re.search(r"galatasaray\s*[-–]\s*\w", t)
+                and any(k in t for k in ("satışa çıktı", "satışta", "satışa sunuldu"))
+                and not any(k in t for k in EXCLUDE + ("ne zaman", "mı?", "mi?"))):
+            key = re.sub(r"\W+", "", t)[:100]
+            if key not in st["seen_news"]:
+                out.append((key, title, link))
+    return out
+
+
+# ------------------------------------------------------------- ana akış
+def fmt_dt(dt):
+    days = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"]
+    return f"{dt:%d.%m.%Y} {days[dt.weekday()]} {dt:%H:%M}"
+
+
+def process(st, now):
+    # 1) Yeni resmi duyurular -> satış takvimi
+    for art in scan_galatasaray(st):
+        phases = parse_sales(art["text"], now)
+        print(f"Duyuru bulundu: {art['title']} -> {len(phases)} satış aşaması")
+        lines = []
+        for dt, who in phases:
+            eid = f"{art['id']}@{dt.isoformat()}"
+            if not any(e["eid"] == eid for e in st["events"]):
+                st["events"].append({"eid": eid, "when": dt.isoformat(), "who": who,
+                                     "title": art["title"], "url": art["url"]})
+            state = "🟢 ŞU AN SATIŞTA" if dt <= now else "⏳"
+            lines.append(f"{state} {fmt_dt(dt)} → {who or 'satış'}")
+        if not phases:
+            lines.append("Satış saati metinden okunamadı, duyuruyu kontrol et.")
+        notify("📢 ŞAMPİYONLAR LİGİ BİLET SATIŞ TAKVİMİ (RAMS Park)\n\n"
+               f"{art['title']}\n\n" + "\n".join(lines) +
+               "\n\nHer aşamadan 30 dk önce ve satış başladığı anda tekrar haber vereceğim."
+               f"\n\n{art['url']}\nPasso: https://www.passo.com.tr")
+        # Duyuru anında zaten başlamış aşamaları "başladı" olarak tekrar gönderme
+        for dt, _ in phases:
+            if dt <= now:
+                st["sent"] += [f"{art['id']}@{dt.isoformat()}:remind",
+                               f"{art['id']}@{dt.isoformat()}:start"]
+
+    # 2) Zamanı gelen hatırlatma / başlangıç bildirimleri
+    for e in sorted(st["events"], key=lambda x: x["when"]):
+        when = datetime.fromisoformat(e["when"])
+        rk, sk = e["eid"] + ":remind", e["eid"] + ":start"
+        if sk in st["sent"]:
+            continue
+        if now >= when - REMIND_BEFORE and now < when and rk not in st["sent"]:
+            mins = int((when - now).total_seconds() // 60) + 1
+            notify(f"⏰ {mins} DAKİKA SONRA BİLET SATIŞI BAŞLIYOR!\n\n{e['title']}\n"
+                   f"{fmt_dt(when)} → {e['who']}\n\nPasso'ya şimdiden giriş yap: "
+                   f"https://www.passo.com.tr")
+            st["sent"].append(rk)
+        if now < when <= now + WAIT_WINDOW:
+            wait = (when - now_tr()).total_seconds()
+            if wait > 0:
+                print(f"Satışa {wait:.0f} sn var, bekleniyor...")
+                save_state(st)
+                time.sleep(wait)
+            now = now_tr()
+        if now >= when:
+            late = int((now - when).total_seconds() // 60)
+            extra = f" ({late} dk önce başladı)" if late >= 2 else ""
+            notify(f"🎟️ BİLET SATIŞI BAŞLADI!{extra}\n\n{e['title']}\n"
+                   f"{e['who']}\n\nHemen Passo'ya gir: https://www.passo.com.tr\n{e['url']}")
+            st["sent"] += [rk, sk]
+
+    # 3) Yedek kaynak
+    try:
+        for key, title, link in google_news_fallback(st):
+            notify(f"🎟️ BİLETLER SATIŞTA (haber kaynağı)\n\n{title}\n{link}\n\n"
+                   "Passo: https://www.passo.com.tr")
+            st["seen_news"].append(key)
+    except Exception as e:
+        print("Uyarı: Google Haberler okunamadı:", e)
 
 
 def main():
     args = sys.argv[1:]
     if "--test" in args:
-        notify("🔔 Bilet alarmı kuruldu! Galatasaray bilet satış duyurusu "
-               "çıktığında buraya mesaj gelecek. ⚽")
+        notify("🔔 Bilet alarmı güncellendi! RAMS Park'taki Şampiyonlar Ligi maçlarının "
+               "biletleri satışa çıktığı anda (ve 30 dk önce) buraya mesaj gelecek. ⚽")
         return
-    items, errors = collect()
-    for e in errors:
-        print("Uyarı:", e)
-    if "--list" in args:
-        for it in items:
-            print("-", fmt(it).replace("\n", " | "))
+    first_run = not STATE_PATH.exists()
+    st = load_state()
+    if "--status" in args:
+        print(f"Son taranan haber no: {st['last_id']}")
+        for e in st["events"]:
+            print(f"- {fmt_dt(datetime.fromisoformat(e['when']))} | {e['title']} | {e['who']}")
         return
-
-    first_run = not SEEN_PATH.exists()
-    seen = set(json.loads(SEEN_PATH.read_text())) if not first_run else set()
-    new = [it for it in items if it["id"] not in seen]
-
     if first_run:
-        print(f"İlk çalışma: {len(items)} mevcut duyuru kaydedildi, bildirim gönderilmedi.")
-    elif new:
-        new.sort(key=lambda x: not x["official"])  # resmi duyurular önce
-        unofficial = [it for it in new if not it["official"]]
-        new = [it for it in new if it["official"]] + unofficial[:2]
-        for it in new:
-            notify("🎟️ BİLET DUYURUSU!\n\n" + fmt(it) +
-                   "\n\nPasso: https://www.passo.com.tr")
-            print("Bildirildi:", it["title"])
+        # Eski haberleri ve eski Google haberlerini bildirmeden işaretle
+        scan_galatasaray(st)
+        try:
+            st["seen_news"] += [k for k, _, _ in google_news_fallback(st)]
+        except Exception:
+            pass
+        print(f"İlk kurulum: haber no {st['last_id']} itibarıyla izleniyor.")
     else:
-        print("Yeni duyuru yok.")
-
-    seen |= {it["id"] for it in items}
-    SEEN_PATH.write_text(json.dumps(sorted(seen)[-2000:], ensure_ascii=False, indent=0))
+        process(st, now_tr())
+    save_state(st)
+    print(f"Tamam. Son haber no: {st['last_id']}, bekleyen aşama: "
+          f"{sum(1 for e in st['events'] if e['eid'] + ':start' not in st['sent'])}")
 
 
 if __name__ == "__main__":
