@@ -1,0 +1,41 @@
+name: Galatasaray bilet alarmı
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # her 5 dakikada bir (GitHub bazen birkaç dk geciktirebilir)
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Telegram'a deneme mesajı gönder"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: alarm
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Duyuruları kontrol et
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ inputs.test }}" = "true" ]; then python3 alarm.py --test; fi
+          python3 alarm.py
+      - name: Görülen duyuruları kaydet
+        run: |
+          git config user.name "bilet-alarm"
+          git config user.email "bilet-alarm@users.noreply.github.com"
+          git add seen.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Görülen duyurular güncellendi"
+            git push
+          fi
