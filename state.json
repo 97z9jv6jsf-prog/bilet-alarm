@@ -1,8 +1,29 @@
 {
- "last_id": 61409,
- "events": [],
- "sent": [],
+ "last_id": 61419,
+ "events": [
+  {
+   "eid": "61412@2026-11-20T11:00:00+03:00",
+   "when": "2026-11-20T11:00:00+03:00",
+   "who": "GSPlus Premium ve GSPara Kredi ve Banka Kartı sahiplerine",
+   "title": "Aston Villa maçının biletleri öncelikli olarak satışta",
+   "url": "https://www.galatasaray.org/haber/futbol/bilet/61412"
+  },
+  {
+   "eid": "61412@2026-11-21T11:00:00+03:00",
+   "when": "2026-11-21T11:00:00+03:00",
+   "who": "GS logolu Passo Taraftar Kartlarına",
+   "title": "Aston Villa maçının biletleri öncelikli olarak satışta",
+   "url": "https://www.galatasaray.org/haber/futbol/bilet/61412"
+  }
+ ],
+ "sent": [
+  "61412@2026-11-20T11:00:00+03:00:remind",
+  "61412@2026-11-20T11:00:00+03:00:start"
+ ],
  "seen_news": [
-  "galatasarayamedspormaçınınbiletlerisatışaçıktıiştesatışşartları"
+  "galatasarayamedspormaçınınbiletlerisatışaçıktıiştesatışşartları",
+  "galatasarayastonvillabiletfiyatları2026galatasarayastonvillamaçbiletisatışaçıktımınasılalınır",
+  "galatasarayastonvillamaçınınbiletleriönceliklisatışta",
+  "galatasarayastonvillamaçınınbiletleriönceliklisatışta"
  ]
 }
